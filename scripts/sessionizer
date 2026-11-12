@@ -7,10 +7,11 @@
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DEFAULT_ROOTS="$HOME/Desktop/Coding:$HOME/Desktop/AI:$HOME/Desktop/Startup"
 HOOK_FILE=".tmux-session.sh"
+MAX_DEPTH=4
 TAB=$'\t'
 OPEN_MARK=$'\033[32m●\033[0m'
 
-# Colon-separated list of directories whose children are projects.
+# Colon-separated list of directories to search for projects (git repositories).
 get_roots() {
     local roots
     roots=$(tmux show-option -gqv @sessionizer-roots 2>/dev/null)
@@ -27,6 +28,15 @@ session_name() {
     project_label "$1" | tr '.:' '__'
 }
 
+# Print the git repositories up to MAX_DEPTH levels below the given roots.
+# Repositories nested inside another listed repository (submodules) are skipped.
+find_repos() {
+    find "$@" -mindepth 2 -maxdepth $((MAX_DEPTH + 1)) \
+        -name node_modules -prune -o -name .git -print 2>/dev/null |
+        sed 's|/\.git$||' | LC_ALL=C sort |
+        awk 'kept == "" || index($0, kept "/") != 1 { kept = $0; print }'
+}
+
 # Print one "dir<TAB>label" row per project, open sessions first.
 list_projects() {
     local roots root dir sessions
@@ -41,14 +51,23 @@ list_projects() {
         echo "sessionizer: no project roots found in: $(get_roots)" >&2
         return 1
     fi
-    sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
-    find "${existing[@]}" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r dir; do
-        if grep -Fxq -- "$(session_name "$dir")" <<<"$sessions"; then
-            printf '0\t%s\t%s %s\n' "$dir" "$OPEN_MARK" "$(project_label "$dir")"
-        else
-            printf '1\t%s\t  %s\n' "$dir" "$(project_label "$dir")"
-        fi
-    done | sort -t "$TAB" -k1,1 -k3,3 | cut -f2-
+    sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | tr '\n' '\t')
+    # Labels and session names are built in awk (mirroring project_label and
+    # session_name) to avoid spawning processes per project.
+    find_repos "${existing[@]}" |
+        awk -F/ -v sessions="$sessions" -v mark="$OPEN_MARK" '
+            BEGIN {
+                count = split(sessions, names, "\t")
+                for (i = 1; i <= count; i++) open[names[i]] = 1
+            }
+            {
+                label = $(NF - 1) "/" $NF
+                name = label
+                gsub(/[.:]/, "_", name)
+                if (name in open) printf "0\t%s\t%s %s\n", $0, mark, label
+                else printf "1\t%s\t  %s\n", $0, label
+            }' |
+        sort -t "$TAB" -k1,1 -k3,3 | cut -f2-
 }
 
 pick_project() {
