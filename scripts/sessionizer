@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Pick a project directory and switch to its tmux session, creating it if needed.
+# Usage: sessionizer [project-dir]
+
+DEFAULT_ROOTS="$HOME/Desktop/Coding:$HOME/Desktop/AI:$HOME/Desktop/Startup"
+HOOK_FILE=".tmux-session.sh"
+
+# Colon-separated list of directories whose children are projects.
+get_roots() {
+    local roots
+    roots=$(tmux show-option -gqv @sessionizer-roots 2>/dev/null)
+    echo "${roots:-$DEFAULT_ROOTS}"
+}
+
+pick_project() {
+    local roots root
+    local existing=()
+    IFS=: read -ra roots <<<"$(get_roots)"
+    for root in "${roots[@]}"; do
+        if [ -d "$root" ]; then
+            existing+=("$root")
+        fi
+    done
+    if [ "${#existing[@]}" -eq 0 ]; then
+        echo "sessionizer: no project roots found in: $(get_roots)" >&2
+        return 1
+    fi
+    find "${existing[@]}" -mindepth 1 -maxdepth 1 -type d | sort |
+        fzf --prompt "project> " --delimiter / --with-nth -2..
+}
+
+# tmux treats "." and ":" in a target as window/pane separators.
+session_name() {
+    basename "$1" | tr '.:' '__'
+}
+
+# Add a window to the session; with a command, type it into the window's shell
+# so the window survives when the program exits.
+add_window() {
+    local name="$1" dir="$2" cmd="$3" window
+    window=$(tmux new-window -d -P -F '#{window_id}' -t "$name:" -c "$dir") || return 1
+    if [ -n "$cmd" ]; then
+        tmux rename-window -t "$window" "$cmd"
+        tmux send-keys -t "$window" "$cmd" Enter
+    fi
+}
+
+# Default layout: nvim, shell, claude, claude, shell.
+default_layout() {
+    local name="$1" dir="$2" first
+    first=$(tmux list-windows -t "=$name" -F '#{window_id}' | head -n 1)
+    tmux rename-window -t "$first" nvim
+    tmux send-keys -t "$first" nvim Enter
+    add_window "$name" "$dir"
+    add_window "$name" "$dir" claude
+    add_window "$name" "$dir" claude
+    add_window "$name" "$dir"
+    tmux select-window -t "$first"
+}
+
+create_session() {
+    local name="$1" dir="$2"
+    tmux new-session -d -s "$name" -c "$dir" || return 1
+    if [ ! -f "$dir/$HOOK_FILE" ]; then
+        default_layout "$name" "$dir"
+        return
+    fi
+    # A project hook replaces the default layout.
+    if ! (cd "$dir" && bash "$HOOK_FILE" "$name" "$dir"); then
+        tmux display-message "sessionizer: $HOOK_FILE failed for $name"
+    fi
+}
+
+main() {
+    local dir="$1" name
+    if [ -z "$dir" ]; then
+        dir=$(pick_project) || return 0
+    fi
+    if [ ! -d "$dir" ]; then
+        echo "sessionizer: not a directory: $dir" >&2
+        return 1
+    fi
+    dir=$(cd "$dir" && pwd)
+    name=$(session_name "$dir")
+
+    if ! tmux has-session -t "=$name" 2>/dev/null; then
+        create_session "$name" "$dir" || return 1
+    fi
+
+    if [ -n "$TMUX" ]; then
+        tmux switch-client -t "=$name"
+    else
+        tmux attach-session -t "=$name"
+    fi
+}
+
+main "$@"
