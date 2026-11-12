@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Pick a project directory and switch to its tmux session, creating it if needed.
 # Usage: sessionizer [project-dir]
+#        sessionizer --list          print picker rows (used by the picker)
+#        sessionizer --kill <dir>    close the session for a project
 
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DEFAULT_ROOTS="$HOME/Desktop/Coding:$HOME/Desktop/AI:$HOME/Desktop/Startup"
 HOOK_FILE=".tmux-session.sh"
+TAB=$'\t'
+OPEN_MARK=$'\033[32m●\033[0m'
 
 # Colon-separated list of directories whose children are projects.
 get_roots() {
@@ -12,8 +17,19 @@ get_roots() {
     echo "${roots:-$DEFAULT_ROOTS}"
 }
 
-pick_project() {
-    local roots root
+# "parent/project", so same-named projects in different roots stay distinct.
+project_label() {
+    echo "$(basename "$(dirname "$1")")/$(basename "$1")"
+}
+
+# tmux treats "." and ":" in a target as window/pane separators.
+session_name() {
+    project_label "$1" | tr '.:' '__'
+}
+
+# Print one "dir<TAB>label" row per project, open sessions first.
+list_projects() {
+    local roots root dir sessions
     local existing=()
     IFS=: read -ra roots <<<"$(get_roots)"
     for root in "${roots[@]}"; do
@@ -25,20 +41,39 @@ pick_project() {
         echo "sessionizer: no project roots found in: $(get_roots)" >&2
         return 1
     fi
-    find "${existing[@]}" -mindepth 1 -maxdepth 1 -type d | sort |
-        fzf --prompt "project> " --delimiter / --with-nth -2..
+    sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    find "${existing[@]}" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r dir; do
+        if grep -Fxq -- "$(session_name "$dir")" <<<"$sessions"; then
+            printf '0\t%s\t%s %s\n' "$dir" "$OPEN_MARK" "$(project_label "$dir")"
+        else
+            printf '1\t%s\t  %s\n' "$dir" "$(project_label "$dir")"
+        fi
+    done | sort -t "$TAB" -k1,1 -k3,3 | cut -f2-
 }
 
-# tmux treats "." and ":" in a target as window/pane separators.
-session_name() {
-    basename "$1" | tr '.:' '__'
+pick_project() {
+    local self selection
+    self=$(printf '%q' "$SCRIPT_PATH")
+    selection=$(list_projects | fzf --ansi --prompt "project> " \
+        --delimiter "$TAB" --with-nth 2 \
+        --header "enter: open   ctrl-x: close session" \
+        --bind "ctrl-x:execute-silent($self --kill {1})+reload($self --list)") || return 1
+    echo "${selection%%"$TAB"*}"
+}
+
+kill_project_session() {
+    local name
+    name=$(session_name "$1")
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        tmux kill-session -t "=$name"
+    fi
 }
 
 # Add a window to the session; with a command, type it into the window's shell
 # so the window survives when the program exits.
 add_window() {
     local name="$1" dir="$2" cmd="$3" window
-    window=$(tmux new-window -d -P -F '#{window_id}' -t "$name:" -c "$dir") || return 1
+    window=$(tmux new-window -d -P -F '#{window_id}' -t "=$name:" -c "$dir") || return 1
     if [ -n "$cmd" ]; then
         tmux rename-window -t "$window" "$cmd"
         tmux send-keys -t "$window" "$cmd" Enter
@@ -71,11 +106,8 @@ create_session() {
     fi
 }
 
-main() {
+open_project() {
     local dir="$1" name
-    if [ -z "$dir" ]; then
-        dir=$(pick_project) || return 0
-    fi
     if [ ! -d "$dir" ]; then
         echo "sessionizer: not a directory: $dir" >&2
         return 1
@@ -92,6 +124,26 @@ main() {
     else
         tmux attach-session -t "=$name"
     fi
+}
+
+main() {
+    local dir
+    case "$1" in
+    --list)
+        list_projects
+        return
+        ;;
+    --kill)
+        kill_project_session "$2"
+        return
+        ;;
+    esac
+
+    dir="$1"
+    if [ -z "$dir" ]; then
+        dir=$(pick_project) || return 0
+    fi
+    open_project "$dir"
 }
 
 main "$@"

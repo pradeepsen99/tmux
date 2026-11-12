@@ -1,3 +1,4 @@
 plugins/*
 !plugins/tpm/
 !plugins/tpm/**
+local.conf
